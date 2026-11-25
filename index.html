@@ -402,11 +402,29 @@ async function initCloud() {
   } catch (e) { cloudNote = "Sauvegarde en ligne indisponible pour l'instant : progression gardée sur cet appareil."; }
 }
 // ---- Sauvegarde manuelle (code à copier dans tes notes) ----
-function exportCode() { return "HANZI1:" + btoa(unescape(encodeURIComponent(JSON.stringify(S)))); }
-function importCode(txt) {
-  const m = (txt || "").trim().match(/HANZI1:([A-Za-z0-9+/=]+)/); if (!m) throw new Error("code");
-  const x = Object.assign(BLANK(), JSON.parse(decodeURIComponent(escape(atob(m[1])))));
-  S = mergeState(S, x); save(); return x;
+// Format HANZI2 : JSON compressé (deflate) en base64url + somme de contrôle, pour détecter un code tronqué.
+const KEEP = ["v", "updated", "xp", "streak", "lastDay", "days", "done", "cards", "chars", "sents", "toneStats", "set", "lessonsDone", "reviews", "dayCount", "speak", "themes", "exams", "acc", "cacc"];
+const fnv = str => { let h = 0x811c9dc5; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } return (h >>> 16).toString(16).padStart(4, "0"); };
+const b64u = u8 => { let s = ""; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); };
+const unb64u = t => { t = t.replace(/-/g, "+").replace(/_/g, "/"); while (t.length % 4) t += "="; const s = atob(t), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; };
+async function zip(str, mode) { const cs = new (mode ? DecompressionStream : CompressionStream)("deflate-raw"); const w = cs.writable.getWriter(); w.write(mode ? str : new TextEncoder().encode(str)); w.close(); const buf = await new Response(cs.readable).arrayBuffer(); return mode ? new TextDecoder().decode(buf) : new Uint8Array(buf); }
+async function exportCode() {
+  const o = {}; KEEP.forEach(k => { if (S[k] != null) o[k] = S[k]; });
+  const json = JSON.stringify(o);
+  try { const body = b64u(await zip(json)); return "HANZI2:" + body + "." + fnv(body); }
+  catch (e) { return "HANZI1:" + btoa(unescape(encodeURIComponent(json))); }
+}
+async function importCode(txt) {
+  const t = (txt || "").replace(/\s+/g, "");
+  let m = t.match(/HANZI2:([A-Za-z0-9_-]+)\.([0-9a-f]{4})/), json;
+  if (m) {
+    if (fnv(m[1]) !== m[2]) throw new Error("Code incomplet ou modifié : recopie-le en entier, jusqu'au dernier caractère.");
+    json = await zip(unb64u(m[1]), true);
+  } else if ((m = t.match(/HANZI1:([A-Za-z0-9+/=]+)/))) {
+    try { json = decodeURIComponent(escape(atob(m[1]))); } catch (e) { throw new Error("Code incomplet : il manque la fin. Recopie-le en entier."); }
+  } else throw new Error("Aucun code trouvé : il doit commencer par HANZI.");
+  let x; try { x = Object.assign(BLANK(), JSON.parse(json)); } catch (e) { throw new Error("Code incomplet : il manque la fin. Recopie-le en entier."); }
+  S = mergeState(S, x); migrateDone(); save(); return x;
 }
 function addXp(n) {
   const d = today();
@@ -2140,13 +2158,20 @@ rWrite = function (ex, b) {
 
 Object.assign(ACT, {
   async bkExport() {
-    const code = exportCode();
-    try { await navigator.clipboard.writeText(code); toast("Code copié : colle-le dans tes notes"); }
-    catch (e) { $("#bkBox").innerHTML = `<p class="small">Copie ce code et garde-le dans tes notes :</p><textarea style="width:100%;height:90px;font-size:11px" readonly>${code}</textarea>`; $("#bkBox textarea").select(); }
+    const code = await exportCode();
+    let copied = false;
+    try { await navigator.clipboard.writeText(code); copied = true; } catch (e) {}
+    $("#bkBox").innerHTML = `<p class="small">${copied ? "Code copié ✓ Colle-le dans tes notes ou dans l'autre version." : "Appuie sur « Tout sélectionner », puis Copier."} Il fait ${code.length} caractères et se termine par <b>${esc(code.slice(-6))}</b>.</p>
+      <textarea id="bkOut" style="width:100%;height:110px;font-size:11px;word-break:break-all" autocorrect="off" autocapitalize="off" spellcheck="false">${code}</textarea>
+      <button class="pill" id="bkSel" style="margin-top:6px">Tout sélectionner</button>`;
+    $("#bkSel").onclick = () => { const t = $("#bkOut"); t.focus(); t.setSelectionRange(0, t.value.length); try { if (document.execCommand("copy")) toast("Code copié"); } catch (e) {} };
   },
   bkImport() {
-    $("#bkBox").innerHTML = `<p class="small">Colle ton code (il est ajouté à ta progression actuelle, rien n'est effacé) :</p><textarea id="bkIn" style="width:100%;height:90px;font-size:11px"></textarea><button class="btn" id="bkGo" style="margin-top:6px">Restaurer</button>`;
-    $("#bkGo").onclick = () => { try { const x = importCode($("#bkIn").value); toast("Progression restaurée"); render(); } catch (e) { toast("Code invalide"); } };
+    $("#bkBox").innerHTML = `<p class="small">Colle ton code (il est ajouté à ta progression actuelle, rien n'est effacé) :</p><textarea id="bkIn" style="width:100%;height:110px;font-size:11px;word-break:break-all" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea><button class="btn" id="bkGo" style="margin-top:6px">Restaurer</button><p class="small" id="bkMsg"></p>`;
+    $("#bkGo").onclick = async () => {
+      try { const x = await importCode($("#bkIn").value); toast("Progression restaurée"); $("#bkMsg").textContent = `Restauré : ${Object.keys(x.done || {}).length} leçons, ${Object.keys(x.cards || {}).length} mots.`; setTimeout(render, 1200); }
+      catch (e) { $("#bkMsg").textContent = e.message || "Code invalide."; $("#bkMsg").style.color = "var(--red)"; }
+    };
   },
   async bkList() {
     const box = $("#bkBox"); box.innerHTML = `<p class="small mute">Lecture des copies…</p>`;
